@@ -1,0 +1,187 @@
+mport sys
+import os
+
+# Add project root (one level up from 'notebooks')
+sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "..")))
+from qiskit import QuantumCircuit
+from qiskit.circuit.random import random_circuit
+from qiskit.transpiler import generate_preset_pass_manager, PassManager
+from qiskit.transpiler.passes import ALAPScheduleAnalysis, PadDynamicalDecoupling
+from qiskit_ibm_runtime import (
+    QiskitRuntimeService,
+    EstimatorV2 as Estimator,
+    EstimatorOptions
+)
+from qiskit.quantum_info import SparsePauliOp
+from qiskit_aer.primitives import EstimatorV2 as AEREstimator
+from qiskit.circuit.library import XGate
+from qiskit.visualization.timeline import draw, IQXStandard
+from utils import cal_em_eff_estimator
+# Number of qubits for the GHZ state
+NUM_QUBITS = 30
+
+# Initialize quantum circuit
+qc = QuantumCircuit(NUM_QUBITS)
+
+# Apply Hadamard gate to first qubit to create superposition
+qc.h(0)
+
+# Create entanglement chain using CNOT gates
+for i in range(NUM_QUBITS - 1):
+    qc.cx(i, i + 1)
+service = QiskitRuntimeService()
+backend = service.backend("ibm_torino")
+target = backend.target
+management.get:WARNING:2025-11-17 16:20:02,946: Loading default saved account
+pm_lvl3 = generate_preset_pass_manager(
+    optimization_level=3, seed_transpiler=42, backend=backend, scheduling_method="alap"
+)
+isa_qc = pm_lvl3.run(qc)
+pauli_string = "Z" * NUM_QUBITS
+
+# The observable is then created from this string
+observable = SparsePauliOp(pauli_string)
+
+isa_observable = observable.apply_layout(isa_qc.layout)
+# isa_qc.draw("mpl", fold=-1)
+DD_SEQUENCE = [XGate(), XGate()]
+
+DD_PM = PassManager(
+    [
+        ALAPScheduleAnalysis(backend.instruction_durations),
+        PadDynamicalDecoupling(
+            durations=backend.instruction_durations, dd_sequence=DD_SEQUENCE
+        ),
+    ]
+)
+
+
+def dynamical_decoupling_preprocess(
+    input_circuit: QuantumCircuit, dd_pass_manager=DD_PM
+) -> QuantumCircuit:
+    """Apply dynamical decoupling to the input circuit.
+
+    Args:
+        input_circuit (QuantumCircuit): input circuit to run error mitigation on.
+    """
+    return dd_pass_manager.run(input_circuit)
+dd_circ_measured = dynamical_decoupling_preprocess(isa_qc)
+# my_style = {
+#     "formatter.general.fig_width": 40,
+#     "formatter.general.fig_unit_height": 2,
+# }
+
+# draw(
+#     dd_circ_measured,
+#     target=backend.target,
+#     style=IQXStandard(**my_style),
+#     show_idle=False,
+#     show_delays=False,
+# )
+aerEstimator = AEREstimator()
+# aerEstimator.options.resilience_level = 0
+
+job = aerEstimator.run([(dd_circ_measured, isa_observable)])
+result = job.result()
+pub_result = result[0]
+evs_ideal = pub_result.data.evs
+print(f"Expectation Value (no mitigation): {evs_ideal}")
+Expectation Value (no mitigation): 1.0
+estimator_options = EstimatorOptions(
+    dynamical_decoupling={"enable": False},
+    twirling={"enable_gates": False, "enable_measure": False},
+    resilience_level=0,
+    max_execution_time=50,
+)
+
+estimator = Estimator(mode=backend, options=estimator_options)
+
+job = estimator.run([(isa_qc, isa_observable), (dd_circ_measured, isa_observable)])
+print(f"Job-Id: {job.job_id()}")
+result = job.result()
+Job-Id: d4dfuopeg65s738lefq0
+# GHZ 30 qubits @ IBM Torino with enable_measure as False
+job = service.job(job_id="d4dfuopeg65s738lefq0")
+
+result = job.result()
+
+pub_result = result[0]
+evs_nodd_ibmtorino = pub_result.data.evs
+print(f"Results without DD:\n{evs_nodd_ibmtorino}")
+
+pub_result = result[1]
+evs_dd_xx_ibmtorino = pub_result.data.evs
+print(f"Results with DD:\n{evs_dd_xx_ibmtorino}")
+Results without DD:
+0.12255859375
+Results with DD:
+0.09228515625
+# --- RUN BENCHMARK ---
+results = cal_em_eff_estimator(evs_nodd_ibmtorino, evs_dd_xx_ibmtorino, evs_ideal)
+
+# --- DISPLAY RESULTS ---
+print(f"--- Dynamic Decoupling Efficacy Benchmark (Estimator) ---")
+print(f"📈 **Absolute Error** (Deviation from 0) (Lower is Better)")
+print(f"  No DD: {results['ERROR_nodd']:.4f} (EVS: {results['EVS_nodd']:.4f})")
+print(f"  With DD: {results['ERROR_dd']:.4f} (EVS: {results['EVS_dd']:.4f})")
+dev_eff_msg = "🎉 Reduced" if results["ERROR_reduction_percent"] > 0 else "⚠️ Increased"
+print(
+    f"  Efficacy: {dev_eff_msg} Error by: {abs(results['ERROR_reduction_percent']):.2f}%"
+)
+
+print("---------------------------------------------------------------")
+--- Dynamic Decoupling Efficacy Benchmark (Estimator) ---
+📈 **Absolute Error** (Deviation from 0) (Lower is Better)
+  No DD: 0.8774 (EVS: 0.1226)
+  With DD: 0.9077 (EVS: 0.0923)
+  Efficacy: ⚠️ Increased Error by: 3.45%
+---------------------------------------------------------------
+estimator_options = EstimatorOptions(
+    dynamical_decoupling={"enable": False},
+    twirling={"enable_gates": True, "enable_measure": True},
+    resilience_level=1,
+    max_execution_time=50,
+)
+
+estimator = Estimator(mode=backend, options=estimator_options)
+
+job = estimator.run([(isa_qc, isa_observable), (dd_circ_measured, isa_observable)])
+print(f"Job-Id: {job.job_id()}")
+result = job.result()
+Job-Id: d4dgeth6dsss73b45plg
+# GHZ 30 qubits @ IBM Torino with enable_measure as True
+job = service.job(job_id="d4dgeth6dsss73b45plg")
+
+result = job.result()
+
+pub_result = result[0]
+evs_nodd_ibmtorino = pub_result.data.evs
+print(f"Results without DD:\n{evs_nodd_ibmtorino}")
+
+pub_result = result[1]
+evs_dd_xx_ibmtorino = pub_result.data.evs
+print(f"Results with DD:\n{evs_dd_xx_ibmtorino}")
+Results without DD:
+0.08346709470304976
+Results with DD:
+0.03210272873194221
+# --- RUN BENCHMARK ---
+results = cal_em_eff_estimator(evs_nodd_ibmtorino, evs_dd_xx_ibmtorino, evs_ideal)
+
+# --- DISPLAY RESULTS ---
+print(f"--- Dynamic Decoupling Efficacy Benchmark (Estimator) ---")
+print(f"📈 **Absolute Error** (Deviation from 0) (Lower is Better)")
+print(f"  No DD: {results['ERROR_nodd']:.4f} (EVS: {results['EVS_nodd']:.4f})")
+print(f"  With DD: {results['ERROR_dd']:.4f} (EVS: {results['EVS_dd']:.4f})")
+dev_eff_msg = "🎉 Reduced" if results["ERROR_reduction_percent"] > 0 else "⚠️ Increased"
+print(
+    f"  Efficacy: {dev_eff_msg} Error by: {abs(results['ERROR_reduction_percent']):.2f}%"
+)
+
+print("---------------------------------------------------------------")
+--- Dynamic Decoupling Efficacy Benchmark (Estimator) ---
+📈 **Absolute Error** (Deviation from 0) (Lower is Better)
+  No DD: 0.9165 (EVS: 0.0835)
+  With DD: 0.9679 (EVS: 0.0321)
+  Efficacy: ⚠️ Increased Error by: 5.60%
+---------------------------------------------------------------
